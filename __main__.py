@@ -18,7 +18,7 @@ from functools import cached_property, wraps
 from math import ceil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 # was introduced with `litellm`
 warnings.filterwarnings('ignore', category=UserWarning, module='pydantic', append=True)
@@ -37,7 +37,8 @@ import telegramify_markdown
 import wolframalpha
 import yaml
 from googleapiclient.discovery import build
-from litellm import Choices, ModelResponse, completion_cost
+from litellm.cost_calculator import completion_cost
+from litellm.files.main import ModelResponse
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -436,17 +437,17 @@ class BadCompletionChoices(LlmResponseFormatError):
 
 
 class OpenaiChat(LmChat):
-    lm_provider: Literal['openai'] = 'openai'
+    lm_provider: Literal['openai'] = 'openai'  # pyright: ignore[reportIncompatibleVariableOverride]
     lm_id: str = 'gpt-5'
+    responses_prev_id: str | None = None
     ADDITIONAL_REQUEST_PARAMS: ClassVar[dict[str, Any]] = dict(
-        reasoning_effort='minimal',
-        verbosity='low',
+        reasoning={'effort': 'minimal'},
     )
 
     @classmethod
     def _assign_cache_breakpoints_to_tools(cls, tools: list[dict[str, Any]]):
-        if tools:
-            tools[-1]['cache_control'] = dict(type='ephemeral')
+        # No-op for Responses API: tools schema does not support cache_control
+        pass
 
     @classmethod
     def _assign_cache_breakpoints_to_messages(cls, new_history: list):
@@ -485,26 +486,32 @@ class OpenaiChat(LmChat):
 
     @cached_property
     def _prepared_tools(self):
-        res = [
-            dict(
-                type='function',
-                function=dict(
+        # Build OpenAI Responses API ToolParam (FunctionToolParam) items
+        res: list[dict[str, Any]] = []
+        for fn in self.tools.values():
+            param_schema = dict(
+                type='object',
+                properties={
+                    arg_name: dict(type=_get_json_schema_type(arg_type))
+                    for arg_name, arg_type in fn.__annotations__.items()
+                    if arg_name != 'return'
+                },
+                additionalProperties=False,
+                required=[
+                    arg_name
+                    for arg_name, _arg_type in fn.__annotations__.items()
+                    if arg_name != 'return'
+                ],
+            )
+            res.append(
+                dict(
+                    type='function',
                     name=fn.__name__,
                     description=fn.__doc__,
-                    parameters=dict(
-                        type='object',
-                        properties={
-                            arg_name: dict(
-                                type=_get_json_schema_type(arg_type),
-                            )
-                            for arg_name, arg_type in fn.__annotations__.items()
-                            if arg_name != 'return'
-                        },
-                    ),
-                ),
+                    parameters=param_schema,
+                    strict=True,
+                )
             )
-            for fn in self.tools.values()
-        ]
         self._assign_cache_breakpoints_to_tools(res)
         return res
 
@@ -535,21 +542,20 @@ class OpenaiChat(LmChat):
     )
     async def _complete_message(
         self, new_history: list[ChatCompletionMessageParam]
-    ) -> ModelResponse:
+    ) -> litellm.ResponsesAPIResponse:
         model = os.path.join(self._litellm_provider, self.lm_id)
         logging.info('Completing with %r', model)
-        completion = await litellm.acompletion(
-            messages=new_history,
+        completion = await litellm.aresponses(
+            input=cast('Any', new_history),
             model=model,
-            tools=self._prepared_tools,
+            tools=cast('Any', self._prepared_tools),
+            previous_response_id=self.responses_prev_id,
             api_key=self._api_key,
             **self.ADDITIONAL_REQUEST_PARAMS,
         )
-        if not isinstance(completion, ModelResponse):
+        if not isinstance(completion, litellm.ResponsesAPIResponse):
             raise UnexpectedResponseTypeError(type(completion))
-        choices = completion.choices
-        if not choices or len(choices) > 1 or not isinstance(choices[0], Choices):
-            raise BadCompletionChoices(choices)
+        self.responses_prev_id = completion.id
         return completion
 
     def _register_usage(self, usage: ModelResponse | None, context: Context):
@@ -573,6 +579,71 @@ class OpenaiChat(LmChat):
         assert isinstance(content, list), type(content)
         return content  # pyright: ignore[reportReturnType]
 
+    def _build_responses_input(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Convert Chat Completions-style history into OpenAI Responses API input list.
+
+        - user/system/developer messages with text -> message items (content as plain string)
+        - tool role -> function_call_output items
+        - skip assistant messages (tracked via previous_response_id)
+        """
+        items: list[dict[str, Any]] = []
+        for turn in history:
+            role = turn.get('role')
+            content = turn.get('content')
+
+            if role == 'tool':
+                call_id = turn.get('tool_call_id')
+                output = turn.get('content', '')
+                if call_id:
+                    items.append(
+                        dict(
+                            type='function_call_output',
+                            call_id=str(call_id),
+                            output=str(output),
+                        )
+                    )
+                continue
+
+            if role in ('user', 'system', 'developer'):
+                text = ''
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            t = block.get('text')
+                            if t:
+                                parts.append(str(t))
+                    text = '\n'.join(parts)
+
+                # Only include messages that actually have textual content
+                if text:
+                    items.append(
+                        dict(
+                            type='message',
+                            role=role,
+                            content=text,
+                        )
+                    )
+        return items
+
+    def _build_responses_delta(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Build only the trailing delta items since the last assistant turn.
+        - Include contiguous tail of history until an 'assistant' role is encountered.
+        - Map using _build_responses_input to proper Responses API items.
+        """
+        tail: list[dict[str, Any]] = []
+        for turn in reversed(history):
+            role = turn.get('role')
+            if role == 'assistant':
+                break
+            tail.append(turn)
+        tail.reverse()
+        return self._build_responses_input(tail)
+
     @property
     def system_prompt(self) -> str:
         if not self.history or self.history[0]['role'] != 'system':
@@ -589,7 +660,7 @@ class OpenaiChat(LmChat):
         else:
             self.history.insert(0, dict(role='system', content=value))
 
-    async def send_message(
+    async def send_message(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         message: str,
         context: Context,
@@ -600,65 +671,127 @@ class OpenaiChat(LmChat):
             dict(role='user', content=message),
         ]  # pyright: ignore[reportAssignmentType]
         while True:
-            self._assign_cache_breakpoints_to_messages(new_history)
-            completion = await self._complete_message(new_history)
+            responses_input = (
+                self._build_responses_delta(cast('list[dict[str, Any]]', new_history))
+                if self.responses_prev_id
+                else self._build_responses_input(cast('list[dict[str, Any]]', new_history))
+            )
+            completion = await self._complete_message(cast('Any', responses_input))
             self._register_usage(completion, context)  # pyright: ignore[reportArgumentType]
-            [choice] = completion.choices
-            assert isinstance(choice, Choices)
-            tool_calls = choice.message.tool_calls
-            assert tool_calls is None or isinstance(tool_calls, list)
-            new_history.append(choice.message.to_dict())  # pyright: ignore[reportArgumentType]
-            self.history = new_history  # we can safely save it at this point  # pyright: ignore[reportAttributeAccessIssue]
+
+            # Extract text and tool calls from Responses API output
+            resp_output = completion.output
+            resp_text_parts: list[str] = []
+            tool_calls = []
+            for item in resp_output:
+                itype = getattr(item, 'type', None)
+                if itype is None and isinstance(item, dict):
+                    itype = item.get('type')
+                if itype == 'message':
+                    content_list = getattr(item, 'content', None)
+                    if content_list is None and isinstance(item, dict):
+                        content_list = item.get('content', [])
+                    for part in content_list or []:
+                        ptype = getattr(part, 'type', None)
+                        if ptype is None and isinstance(part, dict):
+                            ptype = part.get('type')
+                        if ptype in ('output_text', 'text'):
+                            text_val = getattr(part, 'text', None)
+                            if text_val is None and isinstance(part, dict):
+                                text_val = part.get('text')
+                            if text_val:
+                                resp_text_parts.append(str(text_val))
+                elif itype == 'function_call':
+                    name = getattr(item, 'name', None)
+                    if name is None and isinstance(item, dict):
+                        name = item.get('name')
+                    args = getattr(item, 'arguments', None)
+                    if args is None and isinstance(item, dict):
+                        args = item.get('arguments')
+                    call_id = (
+                        (
+                            getattr(item, 'call_id', None)
+                            if not isinstance(item, dict)
+                            else item.get('call_id')
+                        )
+                        or (
+                            getattr(item, 'id', None)
+                            if not isinstance(item, dict)
+                            else item.get('id')
+                        )
+                        or f'call_{len(tool_calls) + 1}'
+                    )
+                    tool_calls.append(
+                        dict(
+                            index=len(tool_calls),
+                            id=call_id,
+                            type='function',
+                            function=dict(name=name or '', arguments=args or '{}'),
+                        )
+                    )
+
+            content_text = ''.join(resp_text_parts).strip()
+
+            # Append assistant turn with content and tool calls (Chat Completions style for compatibility)
+            assistant_turn: dict[str, Any] = dict(role='assistant')
+            if content_text:
+                assistant_turn['content'] = content_text
+            if tool_calls:
+                assistant_turn['tool_calls'] = tool_calls
+            new_history.append(cast('Any', assistant_turn))  # pyright: ignore[reportArgumentType]
+            self.history = new_history  # pyright: ignore[reportAttributeAccessIssue]
+
+            if content_text:
+                yield MessageToSend(text=content_text)
+
             call_futures = (
                 [
                     aio.create_task(
                         self._evaluate_function_call(
-                            tool_call.function.name,
-                            tool_call.function.arguments,
+                            tc['function']['name'] or '',
+                            tc['function']['arguments'] or '{}',
                         )
                     )
-                    for tool_call in tool_calls
+                    for tc in tool_calls
                 ]
-                if tool_calls is not None
+                if tool_calls
                 else None
             )
-            if (content := choice.message.content) is not None:
-                yield MessageToSend(text=content)
+
             if call_futures:
-                assert tool_calls
                 tool_call_reports: list[str] = []
-                for call in tool_calls:
+                for tc in tool_calls:
                     try:
-                        args = ', '.join(
-                            f'{_escape(key)}=`{val}`'
-                            for key, val in json.loads(call.function.arguments).items()
-                        )
+                        args_dict = json.loads(tc['function']['arguments'] or '{}')
+                        args = ', '.join(f'{_escape(k)}=`{v}`' for k, v in args_dict.items())
                     except json.JSONDecodeError:
                         args = '<failed to parse the arguments>'
-                    tool_call_reports.append(f'{call.function.name}({args})')
+                    tool_call_reports.append(f'{tc["function"]["name"]}({args})')
                 yield MessageToSend(
-                    text=f'_Executing {", ".join(tool_call_reports)}..._',
-                    do_notify=False,
+                    text=f'_Executing {", ".join(tool_call_reports)}..._', do_notify=False
                 )
+
                 call_results = await aio.gather(*call_futures)
-                for call, call_result in zip(tool_calls, call_results, strict=True):
+                for tc, call_result in zip(tool_calls, call_results, strict=True):
                     new_history.append(
-                        dict(
-                            role='tool',
-                            tool_call_id=call.id,
-                            name=call.function.name,
-                            content=call_result,
-                        )  # pyright: ignore[reportArgumentType]
-                    )
-            elif choice.finish_reason == 'content_filter':
-                yield MessageToSend(text='_The content was filtered out by OpenAI_')
-                break
-            elif choice.finish_reason == 'stop':
-                break
+                        cast(
+                            'Any',
+                            dict(
+                                role='tool',
+                                tool_call_id=tc['id'],
+                                content=call_result,
+                            ),
+                        )
+                    )  # pyright: ignore[reportArgumentType]
+                # Continue loop to send tool results back
+                continue
+
+            # No tool calls -> we're done
+            break
 
 
 class AnthropicChat(OpenaiChat):
-    lm_provider: Literal['anthropic'] = 'anthropic'
+    lm_provider: Literal['anthropic'] = 'anthropic'  # pyright: ignore[reportIncompatibleVariableOverride]
     lm_id: str = 'claude-sonnet-4-20250514'
     ADDITIONAL_REQUEST_PARAMS: ClassVar[dict[str, Any]] = {
         **OpenaiChat.ADDITIONAL_REQUEST_PARAMS,
@@ -832,7 +965,7 @@ class AnthropicChat(OpenaiChat):
 
 
 class AnthropicThinkingChat(AnthropicChat):
-    lm_provider: Literal['anthropic-thinking'] = 'anthropic-thinking'
+    lm_provider: Literal['anthropic-thinking'] = 'anthropic-thinking'  # pyright: ignore[reportIncompatibleVariableOverride]
     ADDITIONAL_REQUEST_PARAMS: ClassVar[dict[str, Any]] = {
         **AnthropicChat.ADDITIONAL_REQUEST_PARAMS,
         'max_tokens': 64000,
@@ -844,7 +977,7 @@ class AnthropicThinkingChat(AnthropicChat):
 
 
 class GaiChat(OpenaiChat):
-    lm_provider: Literal['google'] = 'google'
+    lm_provider: Literal['google'] = 'google'  # pyright: ignore[reportIncompatibleVariableOverride]
     lm_id: str = 'gemini-2.5-flash'
 
     @classmethod
@@ -865,19 +998,18 @@ class GaiChat(OpenaiChat):
 
 
 class GaiThinkingChat(GaiChat):
-    lm_provider: Literal['google-thinking'] = 'google-thinking'
+    lm_provider: Literal['google-thinking'] = 'google-thinking'  # pyright: ignore[reportIncompatibleVariableOverride]
     lm_id: str = 'gemini-2.5-pro'
     ADDITIONAL_REQUEST_PARAMS: ClassVar[dict[str, Any]] = dict(
-        reasoning_effort='high',
+        reasoning={'effort': 'high'},
     )
 
 
 class OpenaiThinkingChat(OpenaiChat):
-    lm_provider: Literal['openai-thinking'] = 'openai-thinking'
+    lm_provider: Literal['openai-thinking'] = 'openai-thinking'  # pyright: ignore[reportIncompatibleVariableOverride]
     lm_id: str = 'gpt-5'
     ADDITIONAL_REQUEST_PARAMS: ClassVar[dict[str, Any]] = dict(
-        reasoning_effort='high',
-        verbosity='low',
+        reasoning={'effort': 'high'},
     )
 
     @property
@@ -886,7 +1018,7 @@ class OpenaiThinkingChat(OpenaiChat):
 
 
 class XaiChat(OpenaiChat):
-    lm_provider: Literal['xai'] = 'xai'
+    lm_provider: Literal['xai'] = 'xai'  # pyright: ignore[reportIncompatibleVariableOverride]
     lm_id: str = 'grok-4'
 
     @classmethod
@@ -928,10 +1060,13 @@ _CHAT_CLS_BY_PROVIDER_ID: dict[str, type[LmChat]] = dict(
     zip(ProviderId.__args__, AnyChat.__args__, strict=True)
 )
 for provider_id, chat_cls in _CHAT_CLS_BY_PROVIDER_ID.items():
-    try:
-        assert provider_id == chat_cls.model_fields['lm_provider'].annotation.__args__[0]
-    except Exception as exc:
-        raise AssertionError(f'{provider_id!r} does not match with {chat_cls!r}') from exc
+    ann = chat_cls.model_fields['lm_provider'].annotation
+    args = getattr(ann, '__args__', None)
+    if args:
+        try:
+            assert provider_id == args[0]
+        except Exception as exc:
+            raise AssertionError(f'{provider_id!r} does not match with {chat_cls!r}') from exc
 
 
 class Conversation(State):
@@ -1202,21 +1337,21 @@ async def _reply_or_send(
             continue
         match message:
             case telegram.Message():
-                send_message = message.reply_text
+                do_send_message = message.reply_text  # pyright: ignore[reportAssignmentType]
             case int():
                 # this is only possible on the first iteration
-                def send_message(text, *, _chat_id=message, **kwargs):
+                def do_send_message(text, *, _chat_id=message, **kwargs):
                     return context.bot.send_message(chat_id=_chat_id, text=text, **kwargs)
             case _:
                 raise TypeError(type(message))
         try:
-            message = await send_message(
+            message = await do_send_message(
                 telegramify_markdown.markdownify(chunk),
                 disable_notification=disable_notification,
             )
         except telegram.error.BadRequest as exc:
             logging.warning('Could not send a message as Markdown, retrying as HTML:', exc_info=exc)
-            message = await send_message(
+            message = await do_send_message(
                 html.escape(text), parse_mode=telegram.constants.ParseMode.HTML
             )
         chat_data.remember_conversation_id(message)
@@ -1307,8 +1442,8 @@ async def _process_file(
         exc.file_size = file_size
         raise exc
     content = await _download_file(file)
-    if _pdf.is_pdf(content):
-        content = await _pdf_cals.load_pdf(_pdf.Attrs(name=file.file_id), content)
+    if _pdf.is_pdf(bytes(content)):
+        content = await _pdf_cals.load_pdf(_pdf.Attrs(name=file.file_id), bytes(content))
     else:
         content = content.decode()
     return (
@@ -1575,11 +1710,10 @@ async def provider(update: Update, context: Context) -> None:
 async def autoreset(update: Update, context: Context) -> None:
     assert (message := update.message) is not None
     assert (target_chat_data := _get_chat_data_with_impersonation(context)) is not None
+    seconds: int = int(4.5 * 60)
     if (text := message.text_markdown_v2_urled) is not None:
         text = text.strip().removeprefix('/autoreset').lstrip()
-        if not text:
-            seconds = int(4.5 * 60)
-        else:
+        if text:
             try:
                 seconds = int(text)
             except ValueError:
