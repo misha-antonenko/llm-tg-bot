@@ -1,4 +1,4 @@
-# llm-tg-bot
+# llm-telegram-bot
 
 this is a Telegram UI for large language model APIs
 
