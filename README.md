@@ -33,6 +33,7 @@ browser-based UI. this bot offers a Telegram-based UI, which
 - [x] PDF input (the PDFs are converted into text via Mathpix)
 - [x] text file input
 - [x] web search
+- [x] fetching web pages and PDFs
 - [x] WolframAlpha
 - [x] system prompts
 - [x] memory
