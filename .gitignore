@@ -1,0 +1,14 @@
+*.pickle
+__pycache__
+tmp
+state*
+config*.yaml
+.venv
+*.bak
+*.session
+*.session-journal
+.ipynb_checkpoints
+pdf_cals
+notebooks
+*.log
+junk

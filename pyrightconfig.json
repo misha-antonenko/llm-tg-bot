@@ -1,0 +1,5 @@
+{
+    "venvPath": ".venv",
+    "venv": ".venv",
+    "enableTypeIgnoreComments": false
+}

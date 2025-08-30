@@ -1,0 +1,23 @@
+telegram_bot_token: "..."
+owner: 48319198 # replace with yours
+state_dir: state # relative to the project dir
+log_path: bot.log # relative to the project dir
+owner_nickname: misha_antonenko # replace with yours
+allowed_chat_ids: [
+    48319198, # replace with yours and add more as needed
+  ]
+google_search_config:
+  api_key: "..."
+  engine_id: "..."
+gai_config:
+  api_key: "..."
+openai_config:
+  api_key: "..."
+anthropic_config:
+  api_key: "..."
+xai_config:
+  api_key: "..."
+mathpix_config:
+  api_id: "..."
+  api_key: "..."
+wolfram_app_id: "..."
