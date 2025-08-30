@@ -19,7 +19,7 @@ extend-select = [
     "TCH",
     "UP",
 ]
-extend-ignore = ["RUF018", "E402"]
+extend-ignore = ["RUF018", "G004", "E402"]
 fixable = ["ALL"]
 unfixable = []
 

@@ -38,7 +38,11 @@ import wolframalpha
 import yaml
 from googleapiclient.discovery import build
 from litellm.cost_calculator import completion_cost
+from openai.types.responses.response_code_interpreter_tool_call import (
+    ResponseCodeInterpreterToolCall,
+)
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_function_web_search import ResponseFunctionWebSearch
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_refusal import ResponseOutputRefusal
 from openai.types.responses.response_output_text import ResponseOutputText
@@ -404,6 +408,41 @@ class LmChat(ABC, State):
 
         return tools
 
+    @classmethod
+    def _assign_cache_breakpoints_to_tools(cls, tools: list[dict[str, Any]]):
+        pass
+
+    @cached_property
+    def _prepared_tools(self):
+        # Build OpenAI Responses API ToolParam (FunctionToolParam) items
+        res: list[dict[str, Any]] = []
+        for fn in self.tools.values():
+            param_schema = dict(
+                type='object',
+                properties={
+                    arg_name: dict(type=_get_json_schema_type(arg_type))
+                    for arg_name, arg_type in fn.__annotations__.items()
+                    if arg_name != 'return'
+                },
+                additionalProperties=False,
+                required=[
+                    arg_name
+                    for arg_name, _arg_type in fn.__annotations__.items()
+                    if arg_name != 'return'
+                ],
+            )
+            res.append(
+                dict(
+                    type='function',
+                    name=fn.__name__,
+                    description=fn.__doc__,
+                    parameters=param_schema,
+                    strict=True,
+                )
+            )
+        self._assign_cache_breakpoints_to_tools(res)
+        return res
+
     def _update_system_prompt(self, context: Context):
         assert (chat_data := context.chat_data) is not None
         if chat_data.system_prompt != self.system_prompt:
@@ -446,13 +485,8 @@ class OpenaiChat(LmChat):
     lm_id: str = 'gpt-5'
     responses_prev_id: str | None = None
     ADDITIONAL_REQUEST_PARAMS: ClassVar[dict[str, Any]] = dict(
-        reasoning={'effort': 'minimal'},
+        reasoning={'effort': 'low'},
     )
-
-    @classmethod
-    def _assign_cache_breakpoints_to_tools(cls, tools: list[dict[str, Any]]):
-        # No-op for Responses API: tools schema does not support cache_control
-        pass
 
     @classmethod
     def _assign_cache_breakpoints_to_messages(cls, new_history: list):
@@ -491,34 +525,12 @@ class OpenaiChat(LmChat):
 
     @cached_property
     def _prepared_tools(self):
-        # Build OpenAI Responses API ToolParam (FunctionToolParam) items
-        res: list[dict[str, Any]] = []
-        for fn in self.tools.values():
-            param_schema = dict(
-                type='object',
-                properties={
-                    arg_name: dict(type=_get_json_schema_type(arg_type))
-                    for arg_name, arg_type in fn.__annotations__.items()
-                    if arg_name != 'return'
-                },
-                additionalProperties=False,
-                required=[
-                    arg_name
-                    for arg_name, _arg_type in fn.__annotations__.items()
-                    if arg_name != 'return'
-                ],
-            )
-            res.append(
-                dict(
-                    type='function',
-                    name=fn.__name__,
-                    description=fn.__doc__,
-                    parameters=param_schema,
-                    strict=True,
-                )
-            )
-        self._assign_cache_breakpoints_to_tools(res)
-        return res
+        res = super()._prepared_tools
+        return [
+            *(item for item in res if item['name'] != 'search_google'),
+            {'type': 'web_search'},
+            {'type': 'code_interpreter', 'container': {'type': 'auto'}},
+        ]
 
     async def _evaluate_function_call(self, name: str, args: str) -> str:
         try:
@@ -550,6 +562,7 @@ class OpenaiChat(LmChat):
     ) -> litellm.ResponsesAPIResponse:
         model = os.path.join(self._litellm_provider, self.lm_id)
         logging.info('Completing with %r', model)
+        # this is an analog to `openai.responses.create`
         completion = await litellm.aresponses(
             input=cast('Any', new_history),
             model=model,
@@ -717,7 +730,7 @@ class OpenaiChat(LmChat):
                         )
                         continue
                     else:
-                        raise ValueError(f'unexpected item type {itype!r}; whole item: {item}')
+                        logging.warning(f'unexpected item type {itype!r}; whole item: {item}')
                 # Typed SDK objects
                 elif isinstance(item, ResponseOutputMessage):
                     for part in item.content or []:
@@ -744,8 +757,14 @@ class OpenaiChat(LmChat):
                 elif isinstance(item, ResponseReasoningItem):
                     # don't display thoughts to the user
                     continue
+                elif isinstance(item, ResponseFunctionWebSearch):
+                    # TODO: output the parameters of the search
+                    pass
+                elif isinstance(item, ResponseCodeInterpreterToolCall):
+                    # TODO: outputs the logs or images
+                    pass
                 else:
-                    raise TypeError(f'unexpected output type {type(item)}')
+                    logging.warning(f'unexpected output type {type(item)}')
 
             content_text = ''.join(resp_text_parts).strip()
 
