@@ -38,7 +38,11 @@ import wolframalpha
 import yaml
 from googleapiclient.discovery import build
 from litellm.cost_calculator import completion_cost
-from litellm.files.main import ModelResponse
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_output_message import ResponseOutputMessage
+from openai.types.responses.response_output_refusal import ResponseOutputRefusal
+from openai.types.responses.response_output_text import ResponseOutputText
+from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -58,6 +62,7 @@ from _retries import retry
 from _state import State
 
 if TYPE_CHECKING:
+    from litellm.files.main import ModelResponse
     from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
 
@@ -680,47 +685,53 @@ class OpenaiChat(LmChat):
             self._register_usage(completion, context)  # pyright: ignore[reportArgumentType]
 
             # Extract text and tool calls from Responses API output
-            resp_output = completion.output
+            resp_output = completion.output or []
             resp_text_parts: list[str] = []
             tool_calls = []
             for item in resp_output:
-                itype = getattr(item, 'type', None)
-                if itype is None and isinstance(item, dict):
+                # Message items -> accumulate output_text parts
+                if isinstance(item, dict):
                     itype = item.get('type')
-                if itype == 'message':
-                    content_list = getattr(item, 'content', None)
-                    if content_list is None and isinstance(item, dict):
-                        content_list = item.get('content', [])
-                    for part in content_list or []:
-                        ptype = getattr(part, 'type', None)
-                        if ptype is None and isinstance(part, dict):
-                            ptype = part.get('type')
-                        if ptype in ('output_text', 'text'):
-                            text_val = getattr(part, 'text', None)
-                            if text_val is None and isinstance(part, dict):
-                                text_val = part.get('text')
-                            if text_val:
-                                resp_text_parts.append(str(text_val))
-                elif itype == 'function_call':
-                    name = getattr(item, 'name', None)
-                    if name is None and isinstance(item, dict):
-                        name = item.get('name')
-                    args = getattr(item, 'arguments', None)
-                    if args is None and isinstance(item, dict):
-                        args = item.get('arguments')
-                    call_id = (
-                        (
-                            getattr(item, 'call_id', None)
-                            if not isinstance(item, dict)
-                            else item.get('call_id')
+                    if itype == 'message':
+                        content_list = item.get('content', []) or []
+                        for part in content_list:
+                            if isinstance(part, dict):
+                                if part.get('type') in ('output_text', 'text'):
+                                    text_val = part.get('text')
+                                    if text_val:
+                                        resp_text_parts.append(str(text_val))
+                        continue
+                    elif itype == 'function_call':
+                        name = item.get('name', '')
+                        args = item.get('arguments', '{}')
+                        call_id = (
+                            item.get('call_id') or item.get('id') or f'call_{len(tool_calls) + 1}'
                         )
-                        or (
-                            getattr(item, 'id', None)
-                            if not isinstance(item, dict)
-                            else item.get('id')
+                        tool_calls.append(
+                            dict(
+                                index=len(tool_calls),
+                                id=call_id,
+                                type='function',
+                                function=dict(name=name or '', arguments=args or '{}'),
+                            )
                         )
-                        or f'call_{len(tool_calls) + 1}'
-                    )
+                        continue
+                    else:
+                        raise ValueError(f'unexpected item type {itype!r}; whole item: {item}')
+                # Typed SDK objects
+                elif isinstance(item, ResponseOutputMessage):
+                    for part in item.content or []:
+                        if isinstance(part, ResponseOutputText):
+                            if part.text:
+                                resp_text_parts.append(str(part.text))
+                        elif isinstance(part, ResponseOutputRefusal):
+                            # ignore refusal text for normal content aggregation
+                            pass
+                    continue
+                elif isinstance(item, ResponseFunctionToolCall):
+                    name = item.name
+                    args = item.arguments
+                    call_id = item.call_id or (item.id or f'call_{len(tool_calls) + 1}')
                     tool_calls.append(
                         dict(
                             index=len(tool_calls),
@@ -729,6 +740,12 @@ class OpenaiChat(LmChat):
                             function=dict(name=name or '', arguments=args or '{}'),
                         )
                     )
+                    continue
+                elif isinstance(item, ResponseReasoningItem):
+                    # don't display thoughts to the user
+                    continue
+                else:
+                    raise TypeError(f'unexpected output type {type(item)}')
 
             content_text = ''.join(resp_text_parts).strip()
 
